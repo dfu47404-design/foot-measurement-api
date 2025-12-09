@@ -1,0 +1,11 @@
+services:
+  - type: web
+    name: foot-measurement-api
+    env: python
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port 8000
+    envVars:
+      - key: SECRET_KEY
+        value: "VUx4cXpLX2tZNTJldVRwRV9MYXJNX2RrSmpvTzJfVXo="  # SAME AS FYP Auth API
+      - key: DATABASE_URL
+        value: postgresql://fypuser:me9tXj1XwolsOfChIupvOU1OqZQHvwab@dpg-d4pue7c9c44c73b2ie6g-a.singapore-postgres.render.com/fypdb_jozr
