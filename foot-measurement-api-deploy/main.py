@@ -933,7 +933,7 @@ async def root():
             "Multi skin tone support",
             "Realistic male foot size validation (24.5-29.6 cm)"
         ],
-        "note": "Use FYP Auth API (https://fyp-auth-api.onrender.com) for signup/login"
+        "note": "Use FYP Auth API[](https://fyp-auth-api.onrender.com) for signup/login"
     }
 
 
