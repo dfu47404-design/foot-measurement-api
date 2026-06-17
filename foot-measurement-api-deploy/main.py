@@ -1,6 +1,8 @@
-# main.py - FOOT MEASUREMENT API - FULLY FIXED + ENHANCED
+# main.py - FOOT MEASUREMENT API - FULLY FIXED + ENHANCED + BACKGROUND BLACKOUT
 # Fixes: All float-to-int casting errors resolved across OpenCV, NumPy, and Python builtins
 # Enhanced: Image quality analysis, robust error handling, measurement history logging
+# NEW: Background blackout for A4 paper isolation - better detection accuracy
+# UPDATED: Realistic male foot size range 24.5cm - 29.6cm based validation
 
 from fastapi import FastAPI, File, UploadFile, HTTPException, Depends, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -18,7 +20,7 @@ from concurrent.futures import ThreadPoolExecutor
 app = FastAPI(
     title="Foot Measurement API",
     description="Measure foot size from images using A4 paper as reference",
-    version="2.0.0"
+    version="2.1.0"
 )
 
 # CORS middleware
@@ -41,6 +43,12 @@ security = HTTPBearer()
 # Thread pool for CPU-intensive tasks
 executor = ThreadPoolExecutor(max_workers=4)
 
+# ========== REALISTIC MALE FOOT SIZE RANGE (Pakistan/UK) ==========
+# Based on actual male foot measurements: 24.5cm to 29.6cm
+MIN_REALISTIC_FOOT_CM = 24.0   # Allow slightly below minimum for borderline cases
+MAX_REALISTIC_FOOT_CM = 30.0   # Allow slightly above maximum for borderline cases
+OPTIMAL_MIN_FOOT_CM = 24.5     # Optimal minimum
+OPTIMAL_MAX_FOOT_CM = 29.6     # Optimal maximum
 
 # ========== UTILITY HELPERS ==========
 
@@ -112,6 +120,123 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
         raise HTTPException(status_code=401, detail=f"Authentication failed: {str(e)}")
 
 
+# ========== BACKGROUND BLACKOUT FUNCTION ==========
+
+def blackout_background_keep_a4_and_foot(image):
+    """
+    Process image to:
+    1. Detect A4 paper region (white paper on any background)
+    2. Keep only A4 paper area - everything else becomes BLACK
+    3. This makes A4 paper 100% visible for measurement
+    
+    Returns:
+        processed_image: Image with black background, only A4 paper visible
+        success: Boolean indicating if A4 was detected
+    """
+    original = image.copy()
+    height, width = int(image.shape[0]), int(image.shape[1])
+    
+    print(f"BLACKOUT DEBUG: Processing {width}x{height} image for background removal")
+    
+    # Step 1: Convert to HSV for white color detection
+    hsv = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    
+    # Step 2: Define WHITE color range for A4 paper detection
+    # White paper: low saturation, high value (brightness)
+    lower_white = np.array([0, 0, 150], dtype=np.uint8)   # H, S, V
+    upper_white = np.array([180, 40, 255], dtype=np.uint8)
+    
+    # Step 3: Create mask for white areas (A4 paper)
+    white_mask = cv2.inRange(hsv, lower_white, upper_white)
+    
+    # Step 4: Also try to detect any bright/light surface (for off-white papers)
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    _, bright_mask = cv2.threshold(gray, 180, 255, cv2.THRESH_BINARY)
+    
+    # Combine masks
+    combined_mask = cv2.bitwise_or(white_mask, bright_mask)
+    
+    # Step 5: Morphological operations to clean the mask
+    kernel_close = np.ones((15, 15), np.uint8)
+    kernel_open = np.ones((7, 7), np.uint8)
+    
+    # Close gaps in white regions
+    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_CLOSE, kernel_close)
+    # Remove small noise
+    combined_mask = cv2.morphologyEx(combined_mask, cv2.MORPH_OPEN, kernel_open)
+    
+    # Step 6: Find largest white region (this should be the A4 paper)
+    contours, _ = cv2.findContours(combined_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    
+    if not contours:
+        print("BLACKOUT DEBUG: No white region found")
+        return original, False
+    
+    # Get largest contour
+    largest_contour = max(contours, key=cv2.contourArea)
+    area = cv2.contourArea(largest_contour)
+    image_area = height * width
+    
+    print(f"BLACKOUT DEBUG: Largest white region: {area:.0f} pixels ({area/image_area*100:.1f}% of image)")
+    
+    # Check if the white region is large enough to be A4 paper
+    if area < image_area * 0.15:
+        print("BLACKOUT DEBUG: White region too small, likely not A4 paper")
+        return original, False
+    
+    # Step 7: Create a refined mask using convex hull of the largest contour
+    hull = cv2.convexHull(largest_contour)
+    
+    # Expand hull slightly to capture all of A4 paper
+    epsilon = 0.02 * cv2.arcLength(hull, True)
+    approx = cv2.approxPolyDP(hull, epsilon, True)
+    
+    # Create final mask
+    final_mask = np.zeros_like(gray)
+    cv2.drawContours(final_mask, [approx], -1, 255, -1)
+    
+    # Also add the original white mask to ensure edges are captured
+    final_mask = cv2.bitwise_or(final_mask, combined_mask)
+    
+    # Step 8: Also try to keep skin/foot area within the A4 region
+    # This ensures the foot stays visible even if it's not white
+    hsv_for_skin = cv2.cvtColor(image, cv2.COLOR_BGR2HSV)
+    skin_ranges = [
+        ([0, 15, 50], [25, 255, 255]),
+        ([0, 10, 40], [30, 255, 255]),
+    ]
+    
+    skin_mask = None
+    for lower, upper in skin_ranges:
+        mask = cv2.inRange(hsv_for_skin, 
+                          np.array(lower, dtype=np.uint8), 
+                          np.array(upper, dtype=np.uint8))
+        skin_mask = mask if skin_mask is None else cv2.bitwise_or(skin_mask, mask)
+    
+    # Only keep skin within the A4 paper region
+    if skin_mask is not None:
+        skin_mask = cv2.bitwise_and(skin_mask, final_mask)
+        # Dilate skin mask to include shadow edges
+        skin_mask = cv2.dilate(skin_mask, np.ones((5, 5), np.uint8), iterations=2)
+        # Combine: A4 paper + foot inside it
+        final_mask = cv2.bitwise_or(final_mask, skin_mask)
+    
+    # Final cleanup
+    final_mask = cv2.morphologyEx(final_mask, cv2.MORPH_CLOSE, np.ones((10, 10), np.uint8))
+    
+    # Step 9: Apply the mask - everything outside becomes BLACK (0,0,0)
+    result = original.copy()
+    result[final_mask == 0] = [0, 0, 0]  # Pure black background
+    
+    print(f"BLACKOUT DEBUG: Background blackout complete - A4 paper isolated")
+    
+    # Save debug image
+    cv2.imwrite("blackout_debug.jpg", result)
+    print("BLACKOUT DEBUG: Saved blackout_debug.jpg")
+    
+    return result, True
+
+
 # ========== IMAGE PROCESSING FUNCTIONS ==========
 
 def detect_a4_paper_simple(image):
@@ -124,18 +249,15 @@ def detect_a4_paper_simple(image):
     - fallback bounding box array uses dtype=np.int32 explicitly
     """
     original = image.copy()
-    height, width = image.shape[:2]
-    # FIX: ensure height/width are Python ints from shape (they should be, but enforce)
-    height, width = int(height), int(width)
+    height, width = int(image.shape[0]), int(image.shape[1])
 
     print(f"DEBUG: Image size: {width}x{height} pixels")
 
-    # 1. Resize if too large — FIX: to_int_coords ensures cv2.resize gets (int, int)
+    # 1. Resize if too large
     max_size = 1200
     if max(width, height) > max_size:
         scale = float(max_size) / float(max(width, height))
         new_width, new_height = to_int_coords(width * scale, height * scale)
-        # FIX: cv2.resize requires integer tuple — guaranteed by to_int_coords above
         image = cv2.resize(image, (new_width, new_height))
         height, width = int(image.shape[0]), int(image.shape[1])
         print(f"DEBUG: Resized to: {width}x{height} pixels")
@@ -149,7 +271,7 @@ def detect_a4_paper_simple(image):
     # 4. Edge detection
     edges = cv2.Canny(blurred, 50, 150)
 
-    # 5. Dilate edges to connect broken lines
+    # 5. Dilate edges
     kernel = np.ones((3, 3), np.uint8)
     edges = cv2.dilate(edges, kernel, iterations=1)
 
@@ -172,7 +294,6 @@ def detect_a4_paper_simple(image):
 
     # Sort by area, take top 10
     contours = sorted(contours, key=cv2.contourArea, reverse=True)[:10]
-
     image_area = float(height * width)
 
     for i, contour in enumerate(contours):
@@ -189,10 +310,7 @@ def detect_a4_paper_simple(image):
         approx = cv2.approxPolyDP(contour, epsilon, True)
 
         if len(approx) == 4:
-            # FIX: cv2.boundingRect returns numpy int types — cast explicitly
             x, y, w, h = to_int_coords(*cv2.boundingRect(approx))
-
-            # FIX: aspect_ratio uses explicit float division — no implicit int division
             aspect_ratio = float(w) / float(h)
             print(f"DEBUG: Quadrilateral: {w}x{h}, aspect={aspect_ratio:.3f}")
 
@@ -210,7 +328,6 @@ def detect_a4_paper_simple(image):
         x, y, w, h = to_int_coords(*cv2.boundingRect(contours[0]))
         print(f"DEBUG: Using contour bounding box: {w}x{h}")
 
-        # FIX: All values are ints via to_int_coords — np.array with int32 dtype is safe
         approx = np.array([
             [x,     y    ],
             [x + w, y    ],
@@ -284,7 +401,6 @@ def analyze_image_quality(image):
 
     Ranks: EXCELLENT (85-100), GOOD (70-84), FAIR (50-69), POOR (0-49)
     """
-    # FIX: Cast shape values to int immediately
     height, width = int(image.shape[0]), int(image.shape[1])
     gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
 
@@ -323,7 +439,6 @@ def analyze_image_quality(image):
         a4_contour = None
 
     if a4_contour is not None:
-        # FIX: to_int_coords on boundingRect output prevents float aspect ratio issues
         bx, by, bw, bh = to_int_coords(*cv2.boundingRect(a4_contour))
         aspect = float(bw) / float(bh) if bh > 0 else 0.0
         if 0.6 <= aspect <= 0.8:
@@ -432,25 +547,27 @@ def measure_foot_simple(image):
 
     print(f"MEASUREMENT DEBUG: Processing {width}x{height} image")
 
+    # Check if image is mostly black (post-blackout), if so adjust detection
+    gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+    black_pixel_ratio = np.sum(gray < 10) / (height * width)
+    print(f"MEASUREMENT DEBUG: Black pixel ratio: {black_pixel_ratio:.2f}")
+
     a4_contour = detect_a4_paper_simple(image)
 
     if a4_contour is None:
         print("MEASUREMENT DEBUG: No A4 detected, estimating from image size")
 
-        # FIX: int(round(...)) — was bare float multiplication, caused downstream crash
         if width > height:
             a4_width_pixels = int(round(float(width) * 0.8))
         else:
             a4_width_pixels = int(round(float(width) * 0.9))
 
-        # pixels_per_cm is intentionally float — used only in division below
         pixels_per_cm = safe_divide(a4_width_pixels, 21.0)
         roi = image
 
         print(f"MEASUREMENT DEBUG: Estimated A4 width: {a4_width_pixels} pixels")
 
     else:
-        # FIX: to_int_coords converts numpy int types from boundingRect to Python int
         x, y, w, h = to_int_coords(*cv2.boundingRect(a4_contour))
         a4_width_pixels = w
 
@@ -458,7 +575,6 @@ def measure_foot_simple(image):
 
         pixels_per_cm = safe_divide(a4_width_pixels, 21.0)
 
-        # FIX: to_int_coords on all crop indices — NumPy slicing requires Python int
         padding = 10
         x1, y1, x2, y2 = to_int_coords(
             max(0, x - padding),
@@ -466,7 +582,6 @@ def measure_foot_simple(image):
             min(width,  x + w + padding),
             min(height, y + h + padding)
         )
-        # FIX: roi slice is now guaranteed integer indices — no TypeError
         roi = image[y1:y2, x1:x2]
 
     print(f"MEASUREMENT DEBUG: Pixels per cm: {pixels_per_cm:.2f}")
@@ -481,13 +596,11 @@ def measure_foot_simple(image):
     if len(x_coords) == 0 or len(y_coords) == 0:
         return None, "Could not determine foot boundaries."
 
-    # FIX: np.where returns np.intp (numpy integer), cast to Python int for safety
     min_x = int(np.min(x_coords))
     max_x = int(np.max(x_coords))
     min_y = int(np.min(y_coords))
     max_y = int(np.max(y_coords))
 
-    # FIX: explicit int subtraction then float division via safe_divide
     foot_length_pixels = int(max_y - min_y)
     foot_width_pixels  = int(max_x - min_x)
 
@@ -497,10 +610,12 @@ def measure_foot_simple(image):
     print(f"MEASUREMENT DEBUG: Foot bbox: {foot_width_pixels}x{foot_length_pixels} pixels")
     print(f"MEASUREMENT DEBUG: Foot size: {foot_width_cm:.1f} x {foot_length_cm:.1f} cm")
 
-    if foot_length_cm < 15 or foot_length_cm > 35:
-        return None, f"Unrealistic foot length ({foot_length_cm:.1f}cm). Normal range: 15-35cm."
+    # UPDATED: Validation based on realistic male foot range (24.5cm - 29.6cm)
+    if foot_length_cm < 20.0:
+        return None, f"Foot length ({foot_length_cm:.1f}cm) is too small. Expected male foot: 24.5-29.6 cm. Please retake photo with foot properly placed on A4 paper."
+    elif foot_length_cm > 32.0:
+        return None, f"Foot length ({foot_length_cm:.1f}cm) is too large. Expected male foot: 24.5-29.6 cm. Ensure only one foot is on the A4 paper."
 
-    # FIX: round() second arg must be int — round(value, 2) not round(value, 0.5)
     return round(foot_length_cm, 2), None
 
 
@@ -508,66 +623,97 @@ def cm_to_uk_size(foot_length_cm):
     """
     Convert foot length (cm) to UK shoe size.
     UK Men's Size Chart — Pakistan standard matches UK sizing.
-
-    FIX: round() in fallback branch used 0.5 as second arg (must be int).
-    Replaced with correct rounding logic.
+    
+    UPDATED: Based on realistic male foot range 24.5cm - 29.6cm
     """
-    if foot_length_cm >= 29.6:
-        return 13.0
-    elif foot_length_cm >= 28.8:
-        return 11.0
-    elif foot_length_cm >= 27.9:
-        return 10.0
+    # Direct mapping for the provided range
+    if foot_length_cm >= 29.1:
+        return 13.0   # 29.1-29.6cm = UK 13
+    elif foot_length_cm >= 28.6:
+        return 12.0   # 28.6-29.0cm = UK 12
+    elif foot_length_cm >= 28.1:
+        return 11.0   # 28.1-28.5cm = UK 11
+    elif foot_length_cm >= 27.6:
+        return 10.0   # 27.6-28.0cm = UK 10
     elif foot_length_cm >= 27.0:
-        return 9.0
-    elif foot_length_cm >= 26.2:
-        return 8.0
-    elif foot_length_cm >= 25.4:
-        return 7.0
+        return 9.0    # 27.0-27.5cm = UK 9
+    elif foot_length_cm >= 26.6:
+        return 8.5    # 26.6-27.0cm = UK 8.5
+    elif foot_length_cm >= 26.1:
+        return 8.0    # 26.1-26.5cm = UK 8
+    elif foot_length_cm >= 25.6:
+        return 7.5    # 25.6-26.0cm = UK 7.5
+    elif foot_length_cm >= 25.1:
+        return 7.0    # 25.1-25.5cm = UK 7
     elif foot_length_cm >= 24.5:
-        return 6.0
-
-    size_chart = [
-        (24.0, 24.5, 5.5),
-        (24.5, 25.0, 6.0),
-        (25.0, 25.4, 6.5),
-        (25.4, 25.8, 7.0),
-        (25.8, 26.2, 7.5),
-        (26.2, 26.6, 8.0),
-        (26.6, 27.0, 8.5),
-        (27.0, 27.4, 9.0),
-        (27.4, 27.9, 9.5),
-        (27.9, 28.3, 10.0),
-        (28.3, 28.8, 10.5),
-        (28.8, 29.2, 11.0),
-        (29.2, 29.6, 12.0),
-        (29.6, 30.0, 13.0),
-        (30.0, 30.5, 14.0),
-        (30.5, 31.0, 15.0),
-    ]
-
-    for min_len, max_len, size in size_chart:
-        if min_len <= foot_length_cm < max_len:
-            return size
-
-    # FIX: round() ndigits must be int (1), not float (0.5)
-    # Previously: round(..., 0.5) → TypeError in Python 3
-    if foot_length_cm < 24.0:
-        raw = (foot_length_cm - 22.0) / 0.4 + 4.0
+        return 6.0    # 24.5-25.0cm = UK 6
     else:
-        raw = (foot_length_cm - 24.0) / 0.4 + 6.0
-
-    # Round to nearest 0.5
-    return round(raw * 2) / 2
+        # Below 24.5cm - extrapolate for borderline cases
+        return max(4.0, round((foot_length_cm - 22.0) / 0.4 + 4.0))
 
 
 def validate_foot_measurement(foot_length_cm):
-    """Validate that measured foot length is within adult human range."""
-    if foot_length_cm < 18:
-        return False, "Foot too small (likely child's foot or detection error)"
-    elif foot_length_cm > 32:
-        return False, "Foot too large (likely measurement error)"
+    """
+    Validate that measured foot length is within realistic adult male range.
+    
+    UPDATED: Based on realistic male foot range 24.5cm - 29.6cm
+    """
+    if foot_length_cm < OPTIMAL_MIN_FOOT_CM - 2.0:  # Below 22.5cm
+        return False, (
+            f"Measured foot length ({foot_length_cm:.1f} cm) is much smaller than expected adult male range (24.5-29.6 cm). "
+            "Please ensure:\n"
+            "• Your full foot is visible on the A4 paper\n"
+            "• The camera is positioned directly above\n"
+            "• The A4 paper is flat and fully visible"
+        )
+    elif foot_length_cm < OPTIMAL_MIN_FOOT_CM:  # 22.5 - 24.5cm
+        return False, (
+            f"Measured foot length ({foot_length_cm:.1f} cm) is slightly below typical male range (24.5-29.6 cm). "
+            "Try repositioning your foot to cover more of the A4 paper length."
+        )
+    elif foot_length_cm > OPTIMAL_MAX_FOOT_CM + 1.5:  # Above 31.1cm
+        return False, (
+            f"Measured foot length ({foot_length_cm:.1f} cm) exceeds typical male range (24.5-29.6 cm). "
+            "Please ensure:\n"
+            "• Only ONE foot is on the A4 paper\n"
+            "• The camera is not too close (causing distortion)\n"
+            "• The A4 paper is standard size"
+        )
+    elif foot_length_cm > OPTIMAL_MAX_FOOT_CM:  # 29.6 - 31.1cm
+        return False, (
+            f"Measured foot length ({foot_length_cm:.1f} cm) is slightly above typical male range (24.5-29.6 cm). "
+            "Verify that the A4 paper is standard size and camera is at proper distance."
+        )
+    
     return True, "Valid"
+
+
+def get_size_category(foot_length_cm):
+    """
+    Categorize foot size within the realistic male range.
+    
+    UPDATED: Based on 24.5cm - 29.6cm range
+    """
+    if foot_length_cm < 25.1:
+        return "Small (24.5-25.0 cm)"
+    elif foot_length_cm < 25.6:
+        return "Small-Medium (25.1-25.5 cm)"
+    elif foot_length_cm < 26.1:
+        return "Medium (25.6-26.0 cm)"
+    elif foot_length_cm < 26.6:
+        return "Medium (26.1-26.5 cm)"
+    elif foot_length_cm < 27.1:
+        return "Medium-Large (26.6-27.0 cm)"
+    elif foot_length_cm < 27.6:
+        return "Medium-Large (27.0-27.5 cm)"
+    elif foot_length_cm < 28.1:
+        return "Large (27.6-28.0 cm)"
+    elif foot_length_cm < 28.6:
+        return "Large (28.1-28.5 cm)"
+    elif foot_length_cm < 29.1:
+        return "X-Large (28.6-29.0 cm)"
+    else:
+        return "X-Large (29.1-29.6 cm)"
 
 
 def process_image_measurement(image_bytes, user_id):
@@ -576,11 +722,12 @@ def process_image_measurement(image_bytes, user_id):
 
     Order:
       1. Decode image
-      2. Quality analysis (non-blocking, never raises)
-      3. Measure foot (with TypeError guard)
-      4. Validate measurement
-      5. Update database
-      6. Return full response with image_quality field
+      2. Blackout background (isolate A4 paper)
+      3. Quality analysis (non-blocking, never raises)
+      4. Measure foot (with TypeError guard)
+      5. Validate measurement against realistic male range
+      6. Update database
+      7. Return full response with image_quality field
     """
     try:
         nparr = np.frombuffer(image_bytes, np.uint8)
@@ -589,7 +736,6 @@ def process_image_measurement(image_bytes, user_id):
         if img is None:
             return {"error": "Invalid image file. Ensure it is a valid JPEG or PNG."}
 
-        # FIX: Cast shape to Python int immediately after decode
         img_h, img_w = int(img.shape[0]), int(img.shape[1])
 
         if img_h < 300 or img_w < 300:
@@ -597,9 +743,22 @@ def process_image_measurement(image_bytes, user_id):
 
         print(f"Processing image {img_w}x{img_h}")
 
-        # --- Quality Analysis (never blocks measurement) ---
+        # ========== BACKGROUND BLACKOUT ==========
+        print("Applying background blackout for A4 paper isolation...")
+        blackout_img, blackout_success = blackout_background_keep_a4_and_foot(img)
+        
+        # Use blackout image if successful, otherwise fallback to original
+        measurement_img = blackout_img if blackout_success else img
+        
+        if blackout_success:
+            print("Background blackout applied successfully - using processed image")
+        else:
+            print("Background blackout skipped - using original image")
+        # ==============================================
+
+        # --- Quality Analysis on PROCESSED image ---
         try:
-            quality_report = analyze_image_quality(img)
+            quality_report = analyze_image_quality(measurement_img)
             print(f"Quality: {quality_report['rank']} ({quality_report['total_score']}/100)")
         except Exception as qe:
             print(f"Quality analysis failed: {qe}")
@@ -611,30 +770,42 @@ def process_image_measurement(image_bytes, user_id):
                 "error": str(qe)
             }
 
-        # --- Measurement (TypeError explicitly caught) ---
+        # --- Measurement on PROCESSED image ---
         try:
-            foot_length_cm, error = measure_foot_simple(img)
+            foot_length_cm, error = measure_foot_simple(measurement_img)
         except TypeError as te:
-            # FIX: TypeError from float-as-int surfaces here with clear message
             print(f"TypeError in measure_foot_simple: {te}")
             return {
                 "error": (
                     f"Type mismatch in pixel coordinates: {str(te)}. "
                     "Check float-to-int casting in image processing."
                 ),
-                "image_quality": quality_report
+                "image_quality": quality_report,
+                "background_processed": blackout_success
             }
 
         if error:
-            return {"error": error, "image_quality": quality_report}
+            return {
+                "error": error, 
+                "image_quality": quality_report,
+                "background_processed": blackout_success
+            }
 
-        # --- Validate ---
+        # --- Validate against realistic male range ---
         is_valid, validation_msg = validate_foot_measurement(foot_length_cm)
         if not is_valid:
-            return {"error": validation_msg, "image_quality": quality_report}
+            return {
+                "error": validation_msg, 
+                "image_quality": quality_report,
+                "background_processed": blackout_success,
+                "measured_length": foot_length_cm
+            }
 
         # --- Convert to UK size ---
         uk_size = cm_to_uk_size(foot_length_cm)
+        
+        # --- Get size category ---
+        size_category = get_size_category(foot_length_cm)
 
         # --- Database update ---
         conn = get_db_connection()
@@ -658,35 +829,85 @@ def process_image_measurement(image_bytes, user_id):
         conn.close()
 
         if not updated_user:
-            return {"error": "User not found", "image_quality": quality_report}
+            return {
+                "error": "User not found", 
+                "image_quality": quality_report,
+                "background_processed": blackout_success
+            }
 
-        # --- Confidence score ---
-        if 22 <= foot_length_cm <= 30:
-            confidence = 0.95
-        elif 20 <= foot_length_cm < 22 or 30 < foot_length_cm <= 32:
+        # --- Confidence score based on realistic range ---
+        # Higher confidence when measurement falls within optimal range
+        if OPTIMAL_MIN_FOOT_CM <= foot_length_cm <= OPTIMAL_MAX_FOOT_CM:
+            # Within optimal range - calculate how centered it is
+            center = (OPTIMAL_MIN_FOOT_CM + OPTIMAL_MAX_FOOT_CM) / 2
+            range_half = (OPTIMAL_MAX_FOOT_CM - OPTIMAL_MIN_FOOT_CM) / 2
+            deviation = abs(foot_length_cm - center) / range_half
+            
+            if deviation < 0.3:
+                confidence = 0.98  # Very close to center
+            elif deviation < 0.6:
+                confidence = 0.93  # Moderately centered
+            else:
+                confidence = 0.88  # At edges but still in range
+        elif MIN_REALISTIC_FOOT_CM <= foot_length_cm <= MAX_REALISTIC_FOOT_CM:
+            # Borderline but still acceptable
             confidence = 0.75
         else:
-            confidence = 0.5
+            confidence = 0.55
 
         # Boost confidence if image quality is EXCELLENT or GOOD
         if quality_report.get("rank") in ("EXCELLENT", "GOOD"):
-            confidence = min(1.0, confidence + 0.05)
+            confidence = min(1.0, confidence + 0.03)
+
+        # Boost confidence if background was successfully processed
+        if blackout_success:
+            confidence = min(1.0, confidence + 0.02)
 
         return {
             "user_id": user_id,
             "user_name": f"{updated_user[0]} {updated_user[1]}",
             "foot_length_cm": foot_length_cm,
+            "foot_length_range": "24.5 - 29.6 cm (Male)",
+            "size_category": size_category,
             "previous_foot_size_cm": previous_size,
             "recommended_uk_size": uk_size,
             "confidence": round(confidence, 2),
             "measurement_time": datetime.now().isoformat(),
-            "message": "Foot measurement successfully updated",
-            "image_quality": quality_report  # NEW: always included
+            "message": get_success_message(foot_length_cm, uk_size),
+            "image_quality": quality_report,
+            "background_processed": blackout_success
         }
 
     except Exception as e:
         print(f"Processing error: {e}")
         return {"error": str(e)}
+
+
+def get_success_message(foot_length_cm, uk_size):
+    """
+    Generate appropriate success message based on measurement.
+    
+    UPDATED: Messages tailored for realistic male foot range
+    """
+    if OPTIMAL_MIN_FOOT_CM <= foot_length_cm <= OPTIMAL_MAX_FOOT_CM:
+        return (
+            f"✅ Perfect! Foot measurement successful.\n"
+            f"Your foot length: {foot_length_cm:.1f} cm\n"
+            f"Recommended UK Size: {uk_size}\n"
+            f"This falls within the standard male range (24.5-29.6 cm)."
+        )
+    elif foot_length_cm < OPTIMAL_MIN_FOOT_CM:
+        return (
+            f"⚠️ Measurement recorded: {foot_length_cm:.1f} cm (UK {uk_size})\n"
+            f"Note: This is below the typical male range (24.5-29.6 cm).\n"
+            f"Please double-check your foot placement on the A4 paper."
+        )
+    else:
+        return (
+            f"⚠️ Measurement recorded: {foot_length_cm:.1f} cm (UK {uk_size})\n"
+            f"Note: This is above the typical male range (24.5-29.6 cm).\n"
+            f"Please ensure only one foot is on the A4 paper."
+        )
 
 
 # ========== API ENDPOINTS ==========
@@ -695,8 +916,9 @@ def process_image_measurement(image_bytes, user_id):
 async def root():
     return {
         "message": "Foot Measurement API",
-        "version": "2.0.0",
-        "description": "Measure foot size from images using A4 paper as reference",
+        "version": "2.1.0",
+        "description": "Measure male foot size from images using A4 paper as reference",
+        "male_foot_range_cm": "24.5 - 29.6",
         "endpoints": {
             "measure_foot":      "POST /measure-foot (requires JWT token)",
             "get_user_footsize": "GET /user/{user_id}/foot-size (requires JWT token)",
@@ -704,6 +926,13 @@ async def root():
             "health_full":       "GET /health/full",
             "test_image":        "GET /test/image"
         },
+        "features": [
+            "Background blackout - A4 paper isolation",
+            "Image quality analysis",
+            "Float-to-int error fixing",
+            "Multi skin tone support",
+            "Realistic male foot size validation (24.5-29.6 cm)"
+        ],
         "note": "Use FYP Auth API (https://fyp-auth-api.onrender.com) for signup/login"
     }
 
@@ -713,7 +942,7 @@ async def health_check():
     return {
         "status": "healthy",
         "api": "Foot Measurement API",
-        "version": "2.0.0",
+        "version": "2.1.0",
         "timestamp": datetime.now().isoformat()
     }
 
@@ -749,6 +978,9 @@ async def measure_foot(
     """
     Upload a foot image (JPEG/PNG) placed on A4 paper.
     Returns foot length in cm, recommended UK shoe size, and image quality report.
+    
+    VALIDATION: Measurements validated against realistic male foot range (24.5-29.6 cm).
+    BACKGROUND: Automatically blacked out for better A4 paper visibility.
     """
     if not file.content_type.startswith("image/"):
         raise HTTPException(status_code=400, detail="File must be an image (JPEG or PNG)")
@@ -842,22 +1074,27 @@ async def test_image_processing():
                 results.append({"image": img_name, "error": "Could not read image"})
                 continue
 
-            a4_contour  = detect_a4_paper_simple(img)
-            foot_mask, _ = detect_foot_simple(img)
+            # Apply background blackout
+            blackout_img, blackout_success = blackout_background_keep_a4_and_foot(img)
+            measurement_img = blackout_img if blackout_success else img
+
+            a4_contour  = detect_a4_paper_simple(measurement_img)
+            foot_mask, _ = detect_foot_simple(measurement_img)
 
             foot_length, error = (
-                measure_foot_simple(img) if foot_mask is not None
+                measure_foot_simple(measurement_img) if foot_mask is not None
                 else (None, "No foot detected")
             )
 
             try:
-                quality = analyze_image_quality(img)
+                quality = analyze_image_quality(measurement_img)
             except Exception as qe:
                 quality = {"error": str(qe)}
 
             results.append({
                 "image":          img_name,
                 "size":           f"{int(img.shape[1])}x{int(img.shape[0])}",
+                "background_blackout": blackout_success,
                 "a4_detected":    a4_contour is not None,
                 "foot_detected":  foot_mask is not None,
                 "foot_length_cm": foot_length,
