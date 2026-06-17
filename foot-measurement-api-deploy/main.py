@@ -98,8 +98,8 @@ def detect_a4_paper_simple(image):
     max_size = 1200
     if max(width, height) > max_size:
         scale = max_size / max(width, height)
-        new_width = int(width * scale)
-        new_height = int(height * scale)
+        new_width = int(width * scale)  # Cast to int
+        new_height = int(height * scale)  # Cast to int
         image = cv2.resize(image, (new_width, new_height))
         height, width = image.shape[:2]
         print(f"DEBUG: Resized to: {width}x{height} pixels")
@@ -154,7 +154,7 @@ def detect_a4_paper_simple(image):
         
         # Look for quadrilateral
         if len(approx) == 4:
-            # Get bounding rectangle
+            # Get bounding rectangle - cv2.boundingRect returns (x, y, w, h) as integers
             x, y, w, h = cv2.boundingRect(approx)
             
             # Calculate aspect ratio
@@ -179,12 +179,12 @@ def detect_a4_paper_simple(image):
         x, y, w, h = cv2.boundingRect(contours[0])
         print(f"DEBUG: Using contour bounding box: {w}x{h}")
         
-        # Create quadrilateral from bounding box
+        # Create quadrilateral from bounding box - ensure int32
         approx = np.array([
-            [x, y],
-            [x + w, y],
-            [x + w, y + h],
-            [x, y + h]
+            [int(x), int(y)],
+            [int(x + w), int(y)],
+            [int(x + w), int(y + h)],
+            [int(x), int(y + h)]
         ], dtype=np.int32)
         
         return approx
@@ -266,18 +266,20 @@ def measure_foot_simple(image):
         # If no A4 detected, use image dimensions to estimate
         # Assume typical A4 fills most of the image
         if width > height:  # Landscape orientation
-            a4_width_pixels = width * 0.8  # Assume A4 occupies 80% of width
+            a4_width_pixels = int(width * 0.8)  # Cast to int
         else:  # Portrait orientation
-            a4_width_pixels = width * 0.9  # Assume A4 occupies 90% of width
+            a4_width_pixels = int(width * 0.9)  # Cast to int
         
         pixels_per_cm = a4_width_pixels / 21.0
         roi = image
         
-        print(f"MEASUREMENT DEBUG: Estimated A4 width: {a4_width_pixels:.0f} pixels")
+        print(f"MEASUREMENT DEBUG: Estimated A4 width: {a4_width_pixels} pixels")
         
     else:
-        # Get A4 paper dimensions from contour
+        # Get A4 paper dimensions from contour - boundingRect returns ints
         x, y, w, h = cv2.boundingRect(a4_contour)
+        # Ensure they are ints
+        x, y, w, h = int(x), int(y), int(w), int(h)
         a4_width_pixels = w
         
         print(f"MEASUREMENT DEBUG: A4 detected: {w}x{h} pixels")
@@ -285,13 +287,13 @@ def measure_foot_simple(image):
         # A4 actual width is 21.0 cm
         pixels_per_cm = a4_width_pixels / 21.0
         
-        # Crop to A4 region with some padding
+        # Crop to A4 region with some padding - ensure all are ints
         padding = 10
-        x1 = max(0, x - padding)
-        y1 = max(0, y - padding)
-        x2 = min(width, x + w + padding)
-        y2 = min(height, y + h + padding)
-        roi = image[y1:y2, x1:x2]
+        x1 = int(max(0, x - padding))
+        y1 = int(max(0, y - padding))
+        x2 = int(min(width, x + w + padding))
+        y2 = int(min(height, y + h + padding))
+        roi = image[y1:y2, x1:x2]  # Now all indices are integers
     
     print(f"MEASUREMENT DEBUG: Pixels per cm: {pixels_per_cm:.2f}")
     
@@ -310,12 +312,12 @@ def measure_foot_simple(image):
     min_x, max_x = np.min(x_coords), np.max(x_coords)
     min_y, max_y = np.min(y_coords), np.max(y_coords)
     
-    # Calculate foot length (heel to toe)
-    foot_length_pixels = max_y - min_y
+    # Calculate foot length (heel to toe) - these are ints from np.where
+    foot_length_pixels = int(max_y - min_y)  # Cast to int
     foot_length_cm = foot_length_pixels / pixels_per_cm
     
     # Calculate foot width
-    foot_width_pixels = max_x - min_x
+    foot_width_pixels = int(max_x - min_x)  # Cast to int
     foot_width_cm = foot_width_pixels / pixels_per_cm
     
     print(f"MEASUREMENT DEBUG: Foot bbox: {foot_width_pixels}x{foot_length_pixels} pixels")
@@ -406,7 +408,7 @@ def process_image_measurement(image_bytes, user_id):
         if img is None:
             return {"error": "Invalid image file"}
         
-        # Check image dimensions
+        # Check image dimensions - img.shape returns ints, safe
         if img.shape[0] < 300 or img.shape[1] < 300:
             return {"error": "Image too small. Minimum 300x300 pixels."}
         
